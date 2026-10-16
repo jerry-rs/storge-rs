@@ -3,23 +3,37 @@ name = "storge-rs"
 version = "0.1.0"
 edition = "2024"
 
+
+[[bin]]
+name = "storgers"
+path = "src/main.rs"
+
 [dependencies]
 # async-tar 默认 runtime 是 async-std（futures-io），tokio 项目必须显式切到 runtime-tokio
-async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio", "xattr"] }
+async-tar = { version = "0.6.1", default-features = false, features = ["runtime-tokio", "xattr"] }
 axum = "0.8.9"
 bytes = "1.12.1"
-clap = { version = "4", features = ["derive", "env"] }
-ring = "0.17"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+ring = "0.17.14"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["full"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-stream = "0.1.19"
 tower = "0.5.3" # ServeFile 的 Service::call（文件 Range 下载）
-tower-http = { version = "0.7.0", features = ["auth", "fs", "trace"] }
+tower-http = { version = "0.7.1", features = ["auth", "fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa = { version = "6.0", features = ["axum_extras"] }
+# ⚠ 10.x 的 build.rs 硬依赖 `zip = "^8.6"`，而上游把 zip 8.x 全线（连 9.0.0~9.0.2）全部 yank 了，
+#   全新解析会报 “version 8.6.0 is yanked”。Cargo.lock 里已显式钉住 zip 8.6.0（yanked 但可下载），
+#   因此 `cargo build --locked` / 普通构建都正常，但**不要跑裸 `cargo update`**（会重新选 zip 而失败）；
+#   升级单个依赖用 `cargo update -p <crate>`。上游发布不依赖 yanked zip 的版本后可去掉该钉。
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"] }
+
+# 磁盘容量采样：仅 unix 实现（statvfs）；非 unix 不采，守卫自动退化（见 src/disk.rs）
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["fs"] }
+
 
 # 以最高运行速度为目标的 release 配置
 [profile.release]

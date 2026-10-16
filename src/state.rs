@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore};
 
+use crate::disk::DiskMeter;
+
 /// 全局应用状态
 #[derive(Clone)]
 pub struct AppState {
@@ -14,6 +16,8 @@ pub struct AppState {
     /// 全局并发闸门：所有文件共享的磁盘写入操作（分片写入 + 合并）上限，
     /// 多文件并行上传时防止 IO 拥塞
     pub io_slots: Arc<Semaphore>,
+    /// 磁盘容量守卫：采样缓存 + 预留量账本（所有会话共享一份）
+    pub disk: Arc<DiskMeter>,
     /// 按 upload_id 的读写锁：分片上传可并行（读锁），init / 重切 / 合并互斥（写锁）。
     /// 必须先拿本锁，再拿 io_slots，避免交叉等待死锁。
     upload_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
@@ -23,10 +27,26 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
+    /// 测试专用：关掉磁盘容量保护，否则用例会受跑测试那块盘的真实余量影响
+    #[cfg(test)]
+    pub fn unlimited(
         uploads_dir: PathBuf,
         files_dir: PathBuf,
         max_concurrent_uploads: usize,
+    ) -> std::io::Result<Self> {
+        Self::with_limits(
+            uploads_dir,
+            files_dir,
+            max_concurrent_uploads,
+            crate::disk::DiskLimits::unlimited(),
+        )
+    }
+
+    pub fn with_limits(
+        uploads_dir: PathBuf,
+        files_dir: PathBuf,
+        max_concurrent_uploads: usize,
+        limits: crate::disk::DiskLimits,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&uploads_dir)?;
         std::fs::create_dir_all(&files_dir)?;
@@ -34,8 +54,9 @@ impl AppState {
         let uploads_dir = std::fs::canonicalize(&uploads_dir)?;
         let files_dir = std::fs::canonicalize(&files_dir)?;
         Ok(Self {
-            uploads_dir,
-            files_dir,
+            uploads_dir: uploads_dir.clone(),
+            files_dir: files_dir.clone(),
+            disk: DiskMeter::new(files_dir, uploads_dir, limits),
             io_slots: Arc::new(Semaphore::new(max_concurrent_uploads.max(1))),
             upload_locks: Arc::new(Mutex::new(HashMap::new())),
             done_bit_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),

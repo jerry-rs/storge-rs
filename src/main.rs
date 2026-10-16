@@ -1,4 +1,5 @@
 mod config;
+mod disk;
 mod error;
 mod handlers;
 mod openapi;
@@ -23,16 +24,33 @@ async fn main() {
         .init();
 
     let cfg = config::Config::parse();
+    let limits = cfg.disk_limits();
     tracing::info!(
         listen_addr = %cfg.listen_addr,
         uploads_dir = %cfg.uploads_dir.display(),
         files_dir = %cfg.files_dir.display(),
         max_concurrent_uploads = cfg.max_concurrent_uploads,
+        min_free_bytes = limits.min_free,
+        storage_quota = limits.quota,
+        disk_check_ttl_ms = limits.sample_ttl.as_millis(),
+        disk_check_every_chunks = limits.check_every_chunks,
+        upload_ttl_secs = limits.session_ttl.as_secs(),
         "configuration loaded"
     );
 
-    let state = state::AppState::new(cfg.uploads_dir, cfg.files_dir, cfg.max_concurrent_uploads)
-        .expect("failed to init storage directories");
+    let state = state::AppState::with_limits(
+        cfg.uploads_dir,
+        cfg.files_dir,
+        cfg.max_concurrent_uploads,
+        limits,
+    )
+    .expect("failed to init storage directories");
+
+    // 重启前未完成的上传：稀疏 staging 在 statvfs 里只显已落盘部分，先把“声明但未写入”
+    // 的体积重新记账，否则重启后第一批 init 会把磁盘超卖
+    handlers::upload::restore_reservations(&state);
+    // 后台回收闲置超时的上传会话（传一半关浏览器是磁盘被慢慢撑爆的主因）
+    handlers::upload::spawn_upload_janitor(state.clone());
 
     let app = routers::build_global_routers(state);
 

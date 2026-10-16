@@ -7,6 +7,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use utoipa::{IntoParams, ToSchema};
 
+use crate::disk;
 use crate::error::{AppError, ErrorBody};
 use crate::state::AppState;
 use crate::utils::{self, validate_upload_sizes};
@@ -62,6 +63,9 @@ pub struct MergeResp {
     pub sha256: String,
     /// 是否与客户端提供的哈希一致（客户端未提供时为 false）
     pub verified: bool,
+    /// 合并完成后的“还能安全接收”字节（免掉前端一次额外请求）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_available: Option<u64>,
 }
 
 #[derive(Deserialize, IntoParams, ToSchema)]
@@ -134,6 +138,37 @@ impl Meta {
     fn chunk_offset(&self, index: u64) -> u64 {
         index.saturating_mul(self.chunk_size as u64)
     }
+}
+
+// ---------- 磁盘容量守卫（详见 src/disk.rs） ----------
+
+/// init 预检：不足则 507；通过则把本会话的预留记到账上。
+/// 稀疏 staging 文件让 `statvfs` 看不见“声明但未写入”的体积，这笔预留就是来补这个盲区的。
+fn reserve_disk(state: &AppState, upload_id: &str, file_size: u64) -> Result<(), AppError> {
+    let allocated = disk::allocated_bytes(&data_path(&state.uploads_dir, upload_id));
+    let remaining = file_size.saturating_sub(allocated);
+    let need = disk::need_for_upload(file_size, allocated, state.disk.staging_same_volume());
+    // exclude = 自己：重新 init（续传 / 改分片大小）时旧预留不应算成“别人的占用”
+    // need = files 卷（剩余 + 跳卷 merge 副本），remaining = staging 卷本次要写的量
+    state.disk.check(Some(upload_id), need, remaining)?;
+    state.disk.reserve(upload_id, need);
+    Ok(())
+}
+
+/// 周期性复检：先把预留刷新为“尚未落盘 + 跨卷 merge 余量”（已写入的字节不重复计入），
+/// 再确认剩余声明量仍装得下。预留刷新后以 `exclude = 自己` 判定，避免自扣两次。
+fn recheck_disk(state: &AppState, upload_id: &str, file_size: u64) -> Result<(), AppError> {
+    let allocated = disk::allocated_bytes(&data_path(&state.uploads_dir, upload_id));
+    let remaining = file_size.saturating_sub(allocated);
+    let need = disk::need_for_upload(file_size, allocated, state.disk.staging_same_volume());
+    state.disk.reserve(upload_id, need);
+    state.disk.check(Some(upload_id), need, remaining)
+}
+
+/// merge 终检：同卷 rename 不额外吃空间，跨卷退化为 copy 则需再一份
+fn check_merge_disk(state: &AppState, upload_id: &str, file_size: u64) -> Result<(), AppError> {
+    let extra = if state.disk.staging_same_volume() { 0 } else { file_size };
+    state.disk.check(Some(upload_id), extra, 0)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -463,6 +498,8 @@ fn init_sync(state: AppState, req: InitReq, target_dir: String) -> Result<InitRe
                     upload_id = %req.upload_id,
                     "upload_id conflicts with existing metadata, resume rejected"
                 );
+                // 上一个文件的预留对本会话已无意义，直接丢账
+                state.disk.release(&req.upload_id);
                 return Err(AppError::conflict(
                     "upload_id is bound to another file, please re-initialize",
                 ));
@@ -471,6 +508,8 @@ fn init_sync(state: AppState, req: InitReq, target_dir: String) -> Result<InitRe
                 meta.target_dir = target_dir.clone();
                 save_meta(&state.uploads_dir, &req.upload_id, &meta)?;
             }
+            // 续传也要预检：确认“剩下的部分 + 跨卷 merge 余量”仍然装得下
+            reserve_disk(&state, &req.upload_id, meta.file_size)?;
             let uploaded = if meta.chunk_size != req.chunk_size {
                 tracing::info!(
                     upload_id = %req.upload_id,
@@ -492,6 +531,8 @@ fn init_sync(state: AppState, req: InitReq, target_dir: String) -> Result<InitRe
                 total_chunks: req.total_chunks(),
                 target_dir: target_dir.clone(),
             };
+            // 先算账再开稀疏文件：init 阶段拒掉比写到一半 ENOSPC 代价小得多
+            reserve_disk(&state, &req.upload_id, req.file_size)?;
             open_staging(&data_path(&state.uploads_dir, &req.upload_id), req.file_size)?;
             DoneBits::new(meta.total_chunks).save(&state.uploads_dir, &req.upload_id)?;
             save_meta(&state.uploads_dir, &req.upload_id, &meta)?;
@@ -566,6 +607,11 @@ pub async fn upload_chunk(
 
         if (index as u64) >= meta.total_chunks {
             return Err(AppError::bad_request("index out of range"));
+        }
+        // 周期性重采样 + 复检（statvfs 成本被摊销到每 N 片）：磁盘被别的进程写满时
+        // 尽早停手，而不是传到 99% 才在 merge 上撞 ENOSPC
+        if state.disk.tick_chunk_check() {
+            recheck_disk(&state, &upload_id, meta.file_size)?;
         }
         write_chunk(
             &state.uploads_dir,
@@ -643,6 +689,7 @@ fn merge_sync(
             .is_some_and(|c| c.eq_ignore_ascii_case(&actual));
         if idempotent {
             std::fs::remove_dir_all(state.uploads_dir.join(&upload_id)).ok();
+            state.disk.release(&upload_id);
             if let Err(e) = utils::write_file_sha256(&dest_path, &actual, meta.file_size) {
                 tracing::warn!(error = %e, path = %dest_path.display(), "failed to write sha256 sidecar");
             }
@@ -652,6 +699,7 @@ fn merge_sync(
                 path: utils::public_file_path(&meta.target_dir, &meta.filename),
                 sha256: actual,
                 verified: true,
+                disk_available: state.disk.available(true),
             });
         }
         tracing::info!(
@@ -689,6 +737,9 @@ fn merge_sync(
         .ok_or_else(|| AppError::internal("invalid destination path"))?;
     std::fs::create_dir_all(&target)?;
 
+    // merge 终检：同卷 rename 不再吃空间，跨卷时 atomic_replace 会退化为 copy，需要再一份
+    check_merge_disk(&state, &upload_id, meta.file_size)?;
+
     let staging = data_path(&state.uploads_dir, &upload_id);
     let (written, actual) = hash_staging(&staging, meta.file_size)?;
     if written != meta.file_size {
@@ -725,6 +776,7 @@ fn merge_sync(
     let final_path = reserved;
 
     std::fs::remove_dir_all(state.uploads_dir.join(&upload_id)).ok();
+    state.disk.release(&upload_id);
 
     let filename = final_path
         .file_name()
@@ -753,7 +805,143 @@ fn merge_sync(
         path,
         sha256: actual,
         verified,
+        disk_available: state.disk.available(true),
     })
+}
+
+/// 重启后恢复预留账本：稀疏 staging 在 `statvfs` 里只显示已落盘部分，
+/// 剩下的“声明但未写入”体积必须重新记账，否则重启后的并发 init 会超卖磁盘。
+pub fn restore_reservations(state: &AppState) -> usize {
+    let Ok(entries) = std::fs::read_dir(&state.uploads_dir) else {
+        return 0;
+    };
+    let mut restored = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(id) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !valid_id(id) || !path.is_dir() {
+            continue;
+        }
+        let Ok(Some(meta)) = load_meta(&state.uploads_dir, id) else {
+            continue; // 元数据损坏：交给清理任务按时序回收
+        };
+        let allocated = disk::allocated_bytes(&data_path(&state.uploads_dir, id));
+        state.disk.reserve(
+            id,
+            disk::need_for_upload(meta.file_size, allocated, state.disk.staging_same_volume()),
+        );
+        restored += 1;
+    }
+    if restored > 0 {
+        tracing::info!(
+            sessions = restored,
+            reserved = state.disk.pending(),
+            "restored disk reservations for unfinished upload sessions"
+        );
+    }
+    restored
+}
+
+/// 会话最后一次活动时刻：meta.json / data.part / done.bin / 目录本身取最大值。
+/// 全部 stat 失败时返回 `None`（看不清就不删，宁可多留空间）。
+fn session_last_active(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut last: Option<std::time::SystemTime> = None;
+    let mut fold = |p: &Path| {
+        if let Ok(md) = std::fs::symlink_metadata(p)
+            && let Ok(t) = md.modified()
+        {
+            last = Some(last.map_or(t, |cur| cur.max(t)));
+        }
+    };
+    fold(dir);
+    fold(&dir.join("meta.json"));
+    fold(&dir.join("data.part"));
+    fold(&dir.join("done.bin"));
+    last
+}
+
+/// 清理长期无活动的上传会话。这是磁盘被慢慢撑爆的主要来源：
+/// 客户端传一半关掉浏览器后，`uploads/<id>/data.part` 会永远占着空间。
+pub fn cleanup_expired_sessions(state: &AppState) -> usize {
+    let ttl = state.disk.limits().session_ttl;
+    if ttl.is_zero() {
+        return 0;
+    }
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(&state.uploads_dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(id) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !valid_id(id) || !path.is_dir() {
+            continue;
+        }
+        // 活跃会话的 meta.json / data.part mtime 会随着分片写入不断更新，
+        // 因此“闲置超过 ttl”本身就能排除正在传的会话
+        let Some(last) = session_last_active(&path) else {
+            continue;
+        };
+        let Ok(idle) = now.duration_since(last) else {
+            continue;
+        };
+        if idle < ttl {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                state.disk.release(id);
+                removed += 1;
+                tracing::info!(
+                    upload_id = %id,
+                    idle_secs = idle.as_secs(),
+                    "removed expired upload session"
+                );
+            }
+            Err(e) => tracing::warn!(upload_id = %id, error = %e, "failed to remove expired upload session"),
+        }
+    }
+    // 顺带洗掉目录已不存在的残留预留，防账本无界增长
+    let pruned = state.disk.prune_reserved();
+    if removed > 0 || pruned > 0 {
+        tracing::info!(
+            removed_sessions = removed,
+            pruned_reservations = pruned,
+            reserved = state.disk.pending(),
+            "upload session cleanup pass"
+        );
+    }
+    removed
+}
+
+/// 后台清理任务（启动时跑一次，以后按 cleanup_interval 周期跑）
+pub fn spawn_upload_janitor(state: AppState) {
+    let limits = state.disk.limits().clone();
+    if limits.session_ttl.is_zero() {
+        tracing::info!("upload session cleanup disabled (APP_UPLOAD_TTL_SECS=0)");
+        return;
+    }
+    tracing::info!(
+        session_ttl_secs = limits.session_ttl.as_secs(),
+        cleanup_interval_secs = limits.cleanup_interval.as_secs(),
+        "upload session cleanup enabled"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(limits.cleanup_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let st = state.clone();
+            if let Err(e) = utils::blocking(move || Ok(cleanup_expired_sessions(&st))).await {
+                tracing::warn!(error = %e, "upload session cleanup pass failed");
+            }
+        }
+    });
 }
 
 fn parse_sha256(s: &str) -> Result<String, AppError> {
@@ -984,7 +1172,8 @@ mod tests {
     #[test]
     fn integrity_mismatch_keeps_staging_and_clears_bits() {
         let root = tmp_dir();
-        let state = crate::state::AppState::new(root.join("uploads"), root.join("files"), 1).unwrap();
+        let state =
+            crate::state::AppState::unlimited(root.join("uploads"), root.join("files"), 1).unwrap();
         let id = "u-int".to_string();
         std::fs::create_dir_all(state.uploads_dir.join(&id)).unwrap();
         let chunk = MIN_CHUNK_SIZE;
@@ -1089,5 +1278,197 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    // ---------- 磁盘容量守卫 ----------
+
+    use crate::disk::DiskLimits;
+    use std::time::{Duration, SystemTime};
+
+    /// 把文件 / 目录的 mtime 拨旧（模拟闲置会话）。
+    /// 目录需要以 write 权限打开才能 set_modified。
+    fn touch_old(path: &Path, age: Duration) {
+        let stale = SystemTime::now() - age;
+        let opts = std::fs::OpenOptions::new().write(true).open(path);
+        match opts {
+            Ok(f) => {
+                let _ = f.set_modified(stale);
+            }
+            Err(_) => {
+                let _ = std::fs::File::open(path).and_then(|f| f.set_modified(stale));
+            }
+        }
+    }
+
+    fn unlimited_state(root: &Path) -> AppState {
+        AppState::unlimited(root.join("uploads"), root.join("files"), 1).unwrap()
+    }
+
+    fn init_req(id: &str, size: u64) -> InitReq {
+        InitReq {
+            upload_id: id.into(),
+            filename: "a.bin".into(),
+            file_size: size,
+            chunk_size: MIN_CHUNK_SIZE,
+            target_dir: None,
+        }
+    }
+
+    #[test]
+    fn init_reserves_then_merge_releases() {
+        let root = tmp_dir();
+        let state = unlimited_state(&root);
+        init_sync(state.clone(), init_req("d1", 1000), String::new()).unwrap();
+        // 同卷：预留 = 声明体积（稀疏 staging 在 statvfs 里看不见的那部分）
+        assert_eq!(state.disk.pending(), 1000);
+        assert_eq!(state.disk.sessions(), 1);
+
+        let m = load_meta(&state.uploads_dir, "d1").unwrap().unwrap();
+        let lock = state.lock_done_bits("d1");
+        write_chunk(&state.uploads_dir, "d1", &m, 0, &vec![7u8; 1000], &lock).unwrap();
+
+        let resp = merge_sync(state.clone(), "d1".into(), None).unwrap();
+        assert_eq!(state.disk.pending(), 0, "merge 成功后应释放预留");
+        assert_eq!(resp.file_size, 1000);
+        // 只有能采样的平台才会回带余量
+        assert_eq!(resp.disk_available.is_some(), disk::SUPPORTED);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_rejected_when_min_free_cannot_be_met() {
+        let root = tmp_dir();
+        let state = AppState::with_limits(
+            root.join("uploads"),
+            root.join("files"),
+            1,
+            DiskLimits {
+                min_free: u64::MAX / 2, // 任何盘都不可能满足
+                ..DiskLimits::default()
+            },
+        )
+        .unwrap();
+        let result = init_sync(state.clone(), init_req("d2", 1024), String::new());
+        if !disk::SUPPORTED {
+            // 无采样能力的平台：守卫故意退化放行，不能因为保护功能自己不可用而卡住上传
+            assert!(result.is_ok());
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("min_free 不可能满足时 init 必须被拒绝"),
+        };
+        assert_eq!(
+            err.status,
+            axum::http::StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert!(err.message.contains("insufficient disk space"));
+        assert!(err.free.is_some() && err.required.is_some());
+        // 拒绝时不能留下脏预留，也不能预分配 staging
+        assert_eq!(state.disk.pending(), 0);
+        assert!(!data_path(&state.uploads_dir, "d2").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recheck_disk_shrinks_reservation_as_data_lands() {
+        let root = tmp_dir();
+        let state = unlimited_state(&root);
+        std::fs::create_dir_all(state.uploads_dir.join("u-r")).unwrap();
+        let chunk = MIN_CHUNK_SIZE as u64;
+        let m = meta(chunk * 2, MIN_CHUNK_SIZE);
+        save_meta(&state.uploads_dir, "u-r", &m).unwrap();
+        state.disk.reserve("u-r", chunk * 2);
+        assert_eq!(state.disk.pending(), chunk * 2);
+
+        let lock = state.lock_done_bits("u-r");
+        write_chunk(&state.uploads_dir, "u-r", &m, 0, &vec![1u8; chunk as usize], &lock).unwrap();
+        write_chunk(&state.uploads_dir, "u-r", &m, 1, &vec![2u8; chunk as usize], &lock).unwrap();
+
+        recheck_disk(&state, "u-r", m.file_size).unwrap();
+        // 已全部落盘：真实占用部分不再重复预留（同卷下应为 0）
+        assert_eq!(state.disk.pending(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_reservations_subtracts_what_is_already_on_disk() {
+        let root = tmp_dir();
+        let state = unlimited_state(&root);
+        std::fs::create_dir_all(state.uploads_dir.join("u-1")).unwrap();
+        let m = meta(MIN_CHUNK_SIZE as u64 * 4, MIN_CHUNK_SIZE);
+        save_meta(&state.uploads_dir, "u-1", &m).unwrap();
+        open_staging(&data_path(&state.uploads_dir, "u-1"), m.file_size).unwrap();
+        // 无元数据的垃圾目录应当被忽略
+        std::fs::create_dir_all(state.uploads_dir.join("not-an-id")).unwrap();
+
+        assert_eq!(restore_reservations(&state), 1);
+        let allocated = disk::allocated_bytes(&data_path(&state.uploads_dir, "u-1"));
+        assert_eq!(
+            state.disk.pending(),
+            m.file_size.saturating_sub(allocated),
+            "预留 = 声明体积 - 已落盘（稀疏文件按实际块计）"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_removes_only_expired_sessions() {
+        let root = tmp_dir();
+        let state = AppState::with_limits(
+            root.join("uploads"),
+            root.join("files"),
+            1,
+            DiskLimits {
+                session_ttl: Duration::from_secs(3600),
+                ..DiskLimits::default()
+            },
+        )
+        .unwrap();
+        let m = meta(1000, MIN_CHUNK_SIZE);
+
+        let old = state.uploads_dir.join("u-old");
+        std::fs::create_dir_all(&old).unwrap();
+        save_meta(&state.uploads_dir, "u-old", &m).unwrap();
+        touch_old(&old.join("meta.json"), Duration::from_secs(7200));
+        touch_old(&old, Duration::from_secs(7200));
+
+        let fresh = state.uploads_dir.join("u-new");
+        std::fs::create_dir_all(&fresh).unwrap();
+        save_meta(&state.uploads_dir, "u-new", &m).unwrap();
+
+        state.disk.reserve("u-old", 1000);
+        state.disk.reserve("u-new", 2000);
+
+        assert_eq!(cleanup_expired_sessions(&state), 1);
+        assert!(!old.exists(), "过期会话目录应被删除");
+        assert!(fresh.exists(), "活跃会话不能被误删");
+        assert_eq!(state.disk.sessions(), 1);
+        assert_eq!(state.disk.pending(), 2000);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_disabled_when_ttl_zero() {
+        let root = tmp_dir();
+        let state = AppState::with_limits(
+            root.join("uploads"),
+            root.join("files"),
+            1,
+            DiskLimits {
+                session_ttl: Duration::ZERO,
+                ..DiskLimits::default()
+            },
+        )
+        .unwrap();
+        let old = state.uploads_dir.join("u-old");
+        std::fs::create_dir_all(&old).unwrap();
+        save_meta(&state.uploads_dir, "u-old", &meta(1000, MIN_CHUNK_SIZE)).unwrap();
+        touch_old(&old.join("meta.json"), Duration::from_secs(7200));
+        touch_old(&old, Duration::from_secs(7200));
+        assert_eq!(cleanup_expired_sessions(&state), 0);
+        assert!(old.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

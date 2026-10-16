@@ -11,6 +11,9 @@ use crate::utils;
 #[derive(Serialize, ToSchema)]
 pub struct OkResp {
     pub ok: bool,
+    /// 删除后释放空间的“还能安全接收”字节（免掉前端一次额外请求）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_available: Option<u64>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -60,7 +63,11 @@ pub async fn delete_entry(
             return Err(AppError::bad_request("unsupported file type"));
         }
         tracing::info!(path = %canon_target.display(), "entry deleted");
-        Ok(OkResp { ok: true })
+        // 删完强制重采样：否则前端的余量要等到 TTL 过期才动
+        Ok(OkResp {
+            ok: true,
+            disk_available: state.disk.available(true),
+        })
     })
     .await?;
     Ok(Json(value))

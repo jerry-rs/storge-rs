@@ -41,6 +41,7 @@ pub fn protected_global_routers() -> Router<AppState> {
             get(handlers::upload::upload_status),
         )
         .route("/api/entries", get(handlers::list::list_entry))
+        .route("/api/entries/disk", get(handlers::disk::disk_info))
         .route("/api/entries/info", get(handlers::info::entry_info))
         .route("/api/entries/mkdir", post(handlers::mkdir::make_dir_entry))
         .route("/api/entries/rename", post(handlers::rename::rename_entry))
