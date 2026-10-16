@@ -1,0 +1,33 @@
+[package]
+name = "storge-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# async-tar 默认 runtime 是 async-std（futures-io），tokio 项目必须显式切到 runtime-tokio
+async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio", "xattr"] }
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4", features = ["derive", "env"] }
+ring = "0.17"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = "0.1.19"
+tower = "0.5.3" # ServeFile 的 Service::call（文件 Range 下载）
+tower-http = { version = "0.7.0", features = ["auth", "fs", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+
+# 以最高运行速度为目标的 release 配置
+[profile.release]
+opt-level = 3            # 最高优化等级
+lto = "fat"              # 最激进的全程序链接期优化（比 thin LTO 更彻底，编译更慢）
+codegen-units = 1        # 单代码生成单元，保证优化器全局视野
+panic = "abort"          # panic 时直接终止进程，省去展开栈的运行时开销
+overflow-checks = false  # 关闭整数溢出检查（release 默认已关，显式声明）
+strip = "symbols"        # 剥离符号表，减小体积（不影响运行速度）
+# target-cpu = "native"  # 可选：针对本机 CPU 生成指令集（AVX 等），
+#                        # 速度最快但二进制只能在相同 CPU 架构上运行
